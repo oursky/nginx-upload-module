@@ -120,6 +120,7 @@ typedef struct {
 typedef struct ngx_http_upload_cleanup_s {
     ngx_fd_t                         fd;
     u_char                           *filename;
+    u_char                           *state_filename;
     ngx_http_headers_out_t           *headers_out;
     ngx_array_t                      *cleanup_statuses;
     ngx_log_t                        *log;
@@ -384,6 +385,9 @@ static ngx_int_t upload_parse_request_headers(ngx_http_upload_ctx_t *upload_ctx,
  */
 static ngx_int_t upload_process_buf(ngx_http_upload_ctx_t *upload_ctx, u_char *start, u_char *end);
 static ngx_int_t upload_process_raw_buf(ngx_http_upload_ctx_t *upload_ctx, u_char *start, u_char *end);
+
+static void
+ngx_http_upload_cleanup_part(void *data);
 
 static ngx_command_t  ngx_http_upload_commands[] = { /* {{{ */
 
@@ -716,12 +720,60 @@ static ngx_str_t  ngx_upload_field_part2 = { /* {{{ */
     (u_char*)"\"" CRLF CRLF
 }; /* }}} */
 
+static void
+ngx_http_upload_cleanup_part(void *data)
+{
+    ngx_http_request_t *r = data;
+    ngx_http_upload_ctx_t     *u;
+    ngx_int_t                 rc;
+    ngx_http_upload_range_t     content_range_n;
+
+    u = ngx_http_get_module_ctx(r, ngx_http_upload_module);
+    if(!u){
+        return;
+    }
+    
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "cleanup http upload request, out offset: %d", u->output_file.offset);
+    
+    if(!u->raw_input || !u->output_file.offset || 
+        u->output_file.offset == u->content_range_n.end + 1)
+    {
+        return;
+    }
+
+    content_range_n.start = u->content_range_n.start;
+    content_range_n.end = u->output_file.offset - 1;
+    content_range_n.total = u->content_range_n.total;
+
+    rc = ngx_http_upload_merge_ranges(u, &content_range_n);
+
+    if(rc == NGX_ERROR) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0
+            , "upload cleanup: error merging ranges"
+            );
+
+        return;
+    }
+}
+
+
 static ngx_int_t /* {{{ ngx_http_upload_handler */
 ngx_http_upload_handler(ngx_http_request_t *r)
 {
     ngx_http_upload_loc_conf_t  *ulcf;
     ngx_http_upload_ctx_t     *u;
     ngx_int_t                 rc;
+
+    ngx_http_cleanup_t             *cln;
+    cln = ngx_http_cleanup_add(r, 0);
+    if (cln == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    cln->handler = ngx_http_upload_cleanup_part;
+    cln->data = r;
+
 
     if(r->method & NGX_HTTP_OPTIONS)
         return ngx_http_upload_options_handler(r);
@@ -1050,7 +1102,7 @@ static ngx_int_t ngx_http_upload_start_handler(ngx_http_upload_ctx_t *u) { /* {{
     ngx_http_upload_loc_conf_t  *ulcf = ngx_http_get_module_loc_conf(r, ngx_http_upload_module);
 
     ngx_file_t  *file = &u->output_file;
-    ngx_path_t  *path = ulcf->store_path;
+    ngx_path_t  *path = (u->session_id.len == 0 ? ulcf->store_path : ulcf->state_store_path);
     uint32_t    n;
     ngx_uint_t  i;
     ngx_int_t   rc;
@@ -1163,6 +1215,7 @@ static ngx_int_t ngx_http_upload_start_handler(ngx_http_upload_ctx_t *u) { /* {{
         ucln = u->cln->data;
         ucln->fd = file->fd;
         ucln->filename = file->name.data;
+        ucln->state_filename = u->state_file.name.data;
         ucln->log = r->connection->log;
         ucln->headers_out = &r->headers_out;
         ucln->cleanup_statuses = ulcf->cleanup_statuses;
@@ -1857,6 +1910,10 @@ ngx_http_upload_merge_ranges(ngx_http_upload_ctx_t *u, ngx_http_upload_range_t *
         if(ngx_http_upload_buf_merge_range(&ms, &range_to_merge_n) != NGX_OK) {
             ngx_log_error(NGX_LOG_ERR, u->log, 0,
                           "state file \"%V\" is corrupt", &state_file->name);
+            if(ngx_delete_file(&state_file->name) == NGX_FILE_ERROR) { 
+                ngx_log_error(NGX_LOG_ERR, u->log, ngx_errno, 
+                    "failed to remove state file \"%s\"", state_file->name);
+            }
             rc = NGX_ERROR;
             goto failed;
         }
@@ -3844,18 +3901,32 @@ ngx_upload_cleanup_handler(void *data)
         }
 
         if(do_cleanup) {
-                if(ngx_delete_file(cln->filename) == NGX_FILE_ERROR) { 
+            if(ngx_delete_file(cln->filename) == NGX_FILE_ERROR) { 
+                ngx_log_error(NGX_LOG_ERR, cln->log, ngx_errno
+                    , "failed to remove destination file \"%s\" after http status %l"
+                    , cln->filename
+                    , cln->headers_out->status
+                    );
+            }else
+                ngx_log_error(NGX_LOG_INFO, cln->log, 0
+                    , "finished cleanup of file \"%s\" after http status %l"
+                    , cln->filename
+                    , cln->headers_out->status
+                    );
+            if(cln->state_filename){
+                if(ngx_delete_file(cln->state_filename) == NGX_FILE_ERROR) { 
                     ngx_log_error(NGX_LOG_ERR, cln->log, ngx_errno
                         , "failed to remove destination file \"%s\" after http status %l"
-                        , cln->filename
+                        , cln->state_filename
                         , cln->headers_out->status
                         );
                 }else
                     ngx_log_error(NGX_LOG_INFO, cln->log, 0
                         , "finished cleanup of file \"%s\" after http status %l"
-                        , cln->filename
+                        , cln->state_filename
                         , cln->headers_out->status
                         );
+                }
         }
     }
 } /* }}} */

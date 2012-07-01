@@ -2997,6 +2997,11 @@ ngx_http_do_read_upload_client_request_body(ngx_http_request_t *r)
     c = r->connection;
     rb = r->request_body;
 
+    if (u == NULL) {
+        ngx_log_error(NGX_LOG_INFO, c->log, 0, "client closed prematurely connection");
+        return NGX_HTTP_BAD_REQUEST;
+    }
+
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0,
                    "http read client request body");
 

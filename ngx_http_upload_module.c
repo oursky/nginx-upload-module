@@ -1832,7 +1832,6 @@ ngx_http_upload_merge_ranges(ngx_http_upload_ctx_t *u, ngx_http_upload_range_t *
     ngx_http_upload_merger_state_t ms;
     off_t        remaining;
     ssize_t      rc;
-    int          result;
     ngx_buf_t    in_buf;
     ngx_buf_t    out_buf;
     ngx_http_upload_loc_conf_t  *ulcf = ngx_http_get_module_loc_conf(u->request, ngx_http_upload_module);
@@ -1930,7 +1929,10 @@ ngx_http_upload_merge_ranges(ngx_http_upload_ctx_t *u, ngx_http_upload_range_t *
     }
 
     if(out_buf.file_pos < state_file->info.st_size) {
-        result = ftruncate(state_file->fd, out_buf.file_pos);
+        if(ftruncate(state_file->fd, out_buf.file_pos) != 0) {
+            ngx_log_error(NGX_LOG_ERR, u->log, ngx_errno,
+                "failed to truncate state file \"%s\"", state_file->name);
+        }
     }
 
     rc = ms.complete_ranges ? NGX_OK : NGX_AGAIN;
@@ -2859,10 +2861,6 @@ ngx_http_read_upload_client_request_body(ngx_http_request_t *r) {
 
         if (rb->rest <= (off_t) (b->end - b->last)) {
 
-            /* the whole request body may be placed in r->header_in */
-
-            rb->to_write = rb->bufs;
-
             r->read_event_handler = ngx_http_read_upload_client_request_body_handler;
 
             return ngx_http_do_read_upload_client_request_body(r);
@@ -2919,8 +2917,6 @@ ngx_http_read_upload_client_request_body(ngx_http_request_t *r) {
     }
 
     *next = cl;
-
-    rb->to_write = rb->bufs;
 
     r->read_event_handler = ngx_http_read_upload_client_request_body_handler;
 
@@ -2995,6 +2991,11 @@ ngx_http_do_read_upload_client_request_body(ngx_http_request_t *r)
     c = r->connection;
     rb = r->request_body;
 
+    if (u == NULL) {
+        ngx_log_error(NGX_LOG_INFO, c->log, 0, "client closed prematurely connection");
+        return NGX_HTTP_BAD_REQUEST;
+    }
+
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0,
                    "http read client request body");
 
@@ -3002,7 +3003,7 @@ ngx_http_do_read_upload_client_request_body(ngx_http_request_t *r)
         for ( ;; ) {
             if (rb->buf->last == rb->buf->end) {
 
-                rc = ngx_http_process_request_body(r, rb->to_write);
+                rc = ngx_http_process_request_body(r, rb->bufs);
 
                 switch(rc) {
                     case NGX_OK:
@@ -3018,7 +3019,7 @@ ngx_http_do_read_upload_client_request_body(ngx_http_request_t *r)
                         return NGX_HTTP_INTERNAL_SERVER_ERROR;
                 }
 
-                rb->to_write = rb->bufs->next ? rb->bufs->next : rb->bufs;
+                rb->bufs = rb->bufs->next ? rb->bufs->next : rb->bufs;
                 rb->buf->last = rb->buf->start;
             }
 
@@ -3110,7 +3111,7 @@ ngx_http_do_read_upload_client_request_body(ngx_http_request_t *r)
         ngx_del_timer(c->read);
     }
 
-    rc = ngx_http_process_request_body(r, rb->to_write);
+    rc = ngx_http_process_request_body(r, rb->bufs);
 
     switch(rc) {
         case NGX_OK:
